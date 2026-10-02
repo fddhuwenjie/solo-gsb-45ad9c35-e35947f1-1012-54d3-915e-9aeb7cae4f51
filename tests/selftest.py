@@ -418,6 +418,9 @@ def run_checks():
     # -- immutable release batches ------------------------------------------
     run_release_batch_checks()
 
+    # -- fulfillment status snapshots over frozen batches -------------------
+    run_batch_snapshot_checks()
+
     # -- WITH exception removes propagation ----------------------------------
     exc_request = {
         "components": [
@@ -3988,6 +3991,386 @@ def run_release_batch_checks():
           stored == ["rel-001", "rel-multi"]
           and counts == {"rel-001": 2, "rel-multi": 2},
           "%s %s" % (stored, counts))
+
+
+def run_batch_snapshot_checks():
+    """End-to-end checks for POST /v1/release-batches/{id}/fulfillment-snapshot.
+
+    A two-artifact batch (one shared component deduplicated once) backs a
+    snapshot that mixes satisfied / overdue / pending instances, joint
+    ``all`` evidence, product-vs-component material scope, deadline
+    tightening over depends_on, timezone-date material windows,
+    due-on-deadline not overdue, late materials reported on gaps,
+    order-independent snapshot_hash, 404 on an unknown batch and whole
+    422s (never partial results) for invalid scheduling or evidence.
+    """
+    rules = {
+        "licenses": {
+            "S-MIT": {"obligations": ["attribution", "license-text"]},
+            "S-GPL": {
+                "obligations": ["attribution", "license-text", "source-offer"],
+                "propagates": ["static"],
+            },
+            "S-ISC": {"obligations": ["attribution"]},
+        },
+        "obligation_scopes": {"source-offer": ["binary", "source"]},
+    }
+    code, _ = call("PUT", "/v1/rulesets/snaprel", rules)
+    check("snapshot: ruleset published", code == 200)
+
+    def assess(spec):
+        code, out = call("POST", "/v1/assessments",
+                         dict({"ruleset": "snaprel"}, **spec))
+        check("snapshot: assessment ok (%s)" % spec["product"], code == 200,
+              json.dumps(out)[:160])
+        return out["id"]
+
+    aid1 = assess({
+        "product": "snap-a", "distribution": "binary",
+        "components": [
+            {"id": "art-a", "name": "Artifact A", "version": "1.0.0",
+             "license": "S-MIT"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "S-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-a", "to": "common"}],
+    })
+    aid2 = assess({
+        "product": "snap-b", "distribution": "binary",
+        "components": [
+            {"id": "art-b", "name": "Artifact B", "version": "0.9.0",
+             "license": "S-ISC"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "S-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-b", "to": "common"}],
+    })
+    code, batch = call("POST", "/v1/release-batches", {
+        "batch_id": "snap-rel-1",
+        "entries": [
+            {"assessment_id": aid1, "id": "art-a", "version": "1.0.0",
+             "dependencies": ["common"]},
+            {"assessment_id": aid2, "id": "art-b", "version": "0.9.0",
+             "dependencies": ["common"]},
+        ],
+    })
+    check("snapshot: batch registered", code == 200
+          and batch.get("created") is True, json.dumps(batch)[:200])
+    batch_hash = batch["batch_hash"]
+
+    # release Fri 2026-09-25 (Asia/Shanghai); now Sat 2026-10-10.
+    # attribution: 30 calendar days -> 10-25 (not yet due)
+    # license-text: 20 calendar days -> 10-15, tightened to source-offer
+    # source-offer: 5 business days (Sep 28/29/30, Oct 5/6, skipping the
+    #               Oct 1/2 holidays and weekends) -> 10-06 (already past)
+    def snapshot_body(now="2026-10-10T12:00:00+08:00"):
+        return {
+            "batch_id": "snap-rel-1",
+            "now": now,
+            "release_at": "2026-09-25T16:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+            "workdays": [1, 2, 3, 4, 5],
+            "holidays": ["2026-10-01", "2026-10-02"],
+            "obligations": {
+                "attribution": {"offset": 30, "unit": "calendar_day",
+                                "depends_on": []},
+                "license-text": {"offset": 20, "unit": "calendar_day",
+                                 "depends_on": []},
+                "source-offer": {"offset": 5, "unit": "business_day",
+                                 "depends_on": ["license-text"]},
+            },
+            "materials": [
+                {"id": "product-notice", "digest": "sha256:aaa",
+                 "type": "notice", "scope": "product",
+                 "provided_at": "2026-09-26T10:00:00+08:00"},
+                {"id": "common-copy", "digest": "sha256:bbb",
+                 "type": "license-copy", "scope": "component",
+                 "component": "common",
+                 "provided_at": "2026-09-27T10:00:00+08:00"},
+                {"id": "arta-copy", "digest": "sha256:ccc",
+                 "type": "license-copy", "scope": "component",
+                 "component": "art-a",
+                 "provided_at": "2026-09-27T10:00:00+08:00"},
+                {"id": "common-source-late", "digest": "sha256:ddd",
+                 "type": "source-archive", "scope": "component",
+                 "component": "common",
+                 "provided_at": "2026-10-08T10:00:00+08:00"},
+            ],
+            "rules": {"obligations": {
+                "attribution": {"type": "notice"},
+                "license-text": {"all": [
+                    {"type": "notice"},
+                    {"any": [{"type": "license-copy"},
+                             {"type": "license-bundle"}]},
+                ]},
+                "source-offer": {"all": [
+                    {"type": "source-archive"}, {"scope": "component"},
+                ]},
+            }},
+        }
+
+    code, snap = call("POST",
+                      "/v1/release-batches/snap-rel-1/fulfillment-snapshot",
+                      snapshot_body())
+    check("snapshot: 200", code == 200, json.dumps(snap)[:300])
+    check("snapshot: batch hash echoed", snap.get("batch_hash") == batch_hash)
+
+    sched = {i["obligation"]: i for i in snap.get("schedule", [])}
+    check(
+        "snapshot: raw/final deadlines computed and tightened by depends_on",
+        sched["source-offer"]["raw_deadline"] == "2026-10-06"
+        and sched["license-text"]["raw_deadline"] == "2026-10-15"
+        and sched["license-text"]["deadline"] == "2026-10-06"
+        and sched["license-text"]["tightening_chain"]
+        == ["license-text", "source-offer"]
+        and sched["attribution"]["deadline"] == "2026-10-25",
+        json.dumps(sched)[:300],
+    )
+
+    inst = {(i["component"], i["obligation"]): i for i in snap.get("instances", [])}
+    # exactly one instance per merged (component, obligation): common once
+    check(
+        "snapshot: shared component counted once; full instance set",
+        sorted((c, o) for c, o in inst) == sorted([
+            ("art-a", "attribution"), ("art-a", "license-text"),
+            ("art-b", "attribution"),
+            ("common", "attribution"), ("common", "license-text"),
+            ("common", "source-offer"),
+        ]),
+        str(sorted(inst)),
+    )
+    check(
+        "snapshot: satisfied / overdue / pending statuses",
+        inst[("art-a", "attribution")]["status"] == "satisfied"
+        and inst[("art-b", "attribution")]["status"] == "satisfied"
+        and inst[("common", "attribution")]["status"] == "satisfied"
+        and inst[("art-a", "license-text")]["status"] == "satisfied"
+        and inst[("common", "license-text")]["status"] == "satisfied"
+        and inst[("common", "source-offer")]["status"] == "overdue",
+        json.dumps(snap["instances"])[:400],
+    )
+    # joint all: product notice + component copies together satisfy
+    check(
+        "snapshot: multiple materials jointly satisfy all",
+        inst[("art-a", "license-text")]["satisfied_by"]
+        == ["arta-copy", "product-notice"]
+        and inst[("common", "license-text")]["satisfied_by"]
+        == ["common-copy", "product-notice"],
+        json.dumps(inst[("art-a", "license-text")]),
+    )
+    # a component-scoped copy never covers another component; art-b has no
+    # license-text obligation itself, but product notice alone is not enough
+    # for the all at art-a when the art-a copy is missing (checked below)
+    # common-copy (component-scoped, in window) already matches the
+    # scope=component conjunct, so the gap is incomplete evidence with only
+    # the source-archive leaf unmatched; the later source archive is reported
+    # as late (provided 10-08, after the 10-06 deadline)
+    gap = inst[("common", "source-offer")]["gaps"][0]
+    check(
+        "snapshot: overdue gap reports missing leaf, candidates and late",
+        gap["reason"] == "incomplete-evidence"
+        and gap["missing_leaves"] == [{"type": "source-archive"}]
+        and gap["candidate_materials"] == ["common-copy"]
+        and gap["late_materials"] == ["common-source-late"],
+        json.dumps(gap),
+    )
+    check(
+        "snapshot: summary counts",
+        snap.get("summary") == {
+            "total": 6, "satisfied": 5, "overdue": 1, "pending": 0},
+        str(snap.get("summary")),
+    )
+
+    # due exactly on the deadline date must NOT be overdue; source-offer is
+    # unsatisfied but its 10-06 deadline is still open on 10-06
+    code, due = call("POST",
+                     "/v1/release-batches/snap-rel-1/fulfillment-snapshot",
+                     snapshot_body(now="2026-10-06T23:59:00+08:00"))
+    di = {(i["component"], i["obligation"]): i for i in due["instances"]}
+    dgap = di[("common", "source-offer")]["gaps"][0]
+    check("snapshot: due-on-deadline is pending, never overdue",
+          code == 200
+          and di[("common", "source-offer")]["status"] == "pending"
+          and dgap["reason"] == "incomplete-evidence"
+          and dgap["candidate_materials"] == ["common-copy"]
+          and dgap["missing_leaves"] == [{"type": "source-archive"}])
+    # the late source (provided 10-08) is still after the 10-06 deadline
+    check("snapshot: due-on-deadline gap marks future material late",
+          dgap["late_materials"] == ["common-source-late"])
+
+    # a material provided ON the deadline date is inside the window
+    on_time = snapshot_body()
+    on_time["materials"][3]["provided_at"] = "2026-10-06T09:00:00+08:00"
+    code, ok = call("POST",
+                    "/v1/release-batches/snap-rel-1/fulfillment-snapshot",
+                    on_time)
+    oi = {(i["component"], i["obligation"]): i for i in ok["instances"]}
+    check(
+        "snapshot: provided-on-deadline material satisfies (date window)",
+        code == 200
+        and oi[("common", "source-offer")]["status"] == "satisfied"
+        and oi[("common", "source-offer")]["satisfied_by"]
+        == ["common-copy", "common-source-late"]
+        and ok["summary"] == {"total": 6, "satisfied": 6,
+                              "overdue": 0, "pending": 0},
+        json.dumps(oi[("common", "source-offer")]),
+    )
+
+    # component scope: removing art-a's copy makes art-a license-text
+    # incomplete; common is unaffected by the art-a copy
+    no_arta = snapshot_body()
+    no_arta["materials"] = [
+        m for m in no_arta["materials"] if m["id"] != "arta-copy"
+    ]
+    code, miss = call("POST",
+                      "/v1/release-batches/snap-rel-1/fulfillment-snapshot",
+                      no_arta)
+    mi = {(i["component"], i["obligation"]): i for i in miss["instances"]}
+    # 10-03 is before the tightened 10-06 license-text deadline -> pending
+    agap = mi[("art-a", "license-text")]["gaps"][0]
+    check(
+        "snapshot: component material covers only its component; overdue gap",
+        mi[("art-a", "license-text")]["status"] == "overdue"
+        and agap["reason"] == "incomplete-evidence"
+        and agap["candidate_materials"] == ["product-notice"]
+        and agap["missing_leaves"] == [
+            {"type": "license-bundle"}, {"type": "license-copy"}],
+        json.dumps(agap),
+    )
+    check(
+        "snapshot: other components unaffected",
+        mi[("common", "license-text")]["status"] == "satisfied"
+        and mi[("art-b", "attribution")]["status"] == "satisfied",
+    )
+
+    # missing evidence rule for one obligation: all instances overdue/pending
+    no_rules = snapshot_body()
+    no_rules["rules"]["obligations"].pop("source-offer")
+    code, nr = call("POST",
+                    "/v1/release-batches/snap-rel-1/fulfillment-snapshot",
+                    no_rules)
+    ni = {(i["component"], i["obligation"]): i for i in nr["instances"]}
+    check(
+        "snapshot: missing evidence rule -> never satisfied, reason reported",
+        code == 200
+        and ni[("common", "source-offer")]["status"] == "overdue"
+        and ni[("common", "source-offer")]["gaps"][0]["reason"]
+        == "no-evidence-rule",
+    )
+
+    # order invariance: shuffle materials, object keys, workdays, holidays
+    perm = snapshot_body()
+    perm["materials"] = list(reversed(perm["materials"]))
+    perm["workdays"] = [5, 4, 3, 2, 1]
+    perm["holidays"] = ["2026-10-02", "2026-10-01"]
+    perm["obligations"] = {
+        "source-offer": {"depends_on": ["license-text"], "unit": "business_day",
+                         "offset": 5},
+        "attribution": {"depends_on": [], "unit": "calendar_day", "offset": 30},
+        "license-text": {"depends_on": [], "unit": "calendar_day", "offset": 20},
+    }
+    code, perm_out = call(
+        "POST", "/v1/release-batches/snap-rel-1/fulfillment-snapshot", perm)
+    check("snapshot: request order does not change snapshot_hash",
+          code == 200 and perm_out["snapshot_hash"] == snap["snapshot_hash"],
+          "%s vs %s" % (perm_out.get("snapshot_hash"),
+                        snap.get("snapshot_hash")))
+    check("snapshot: hash is sha256", len(snap.get("snapshot_hash", "")) == 64)
+
+    # same instant written in UTC lands on the same local dates/hash
+    utc_body = dict(snapshot_body(),
+                    release_at="2026-09-25T08:00:00Z",
+                    now="2026-10-10T04:00:00Z")
+    code, utc_out = call(
+        "POST", "/v1/release-batches/snap-rel-1/fulfillment-snapshot", utc_body)
+    check("snapshot: equivalent instants normalize to same hash",
+          code == 200 and utc_out["snapshot_hash"] == snap["snapshot_hash"])
+
+    # 404: unknown batch
+    code, b = call("POST",
+                   "/v1/release-batches/no-such-batch/fulfillment-snapshot",
+                   snapshot_body())
+    check("snapshot: unknown batch -> 404", code == 404)
+
+    # 400: non-object envelope
+    code, _ = call("POST",
+                   "/v1/release-batches/snap-rel-1/fulfillment-snapshot", ["x"])
+    check("snapshot: non-object body -> 400", code == 400)
+
+    # 422: every invalid scheduling/evidence case fails whole, no partial
+    def mutate(fn):
+        b2 = json.loads(json.dumps(snapshot_body()))
+        fn(b2)
+        return b2
+
+    def cycle(b2):
+        b2["obligations"]["license-text"]["depends_on"] = ["source-offer"]
+
+    invalid = [
+        ("batch id mismatch",
+         mutate(lambda b2: b2.update(batch_id="other-batch"))),
+        ("missing obligation rule",
+         mutate(lambda b2: b2["obligations"].pop("attribution"))),
+        ("unknown timezone", mutate(lambda b2: b2.update(timezone="Mars/Olympus"))),
+        ("bad now", mutate(lambda b2: b2.update(now="2026-10-03 12:00"))),
+        ("bad release_at",
+         mutate(lambda b2: b2.update(release_at="2026-09-25T16:00:00"))),
+        ("bad holiday", mutate(lambda b2: b2.update(holidays=["10/1/2026"]))),
+        ("bad workday", mutate(lambda b2: b2.update(workdays=[0, 1]))),
+        ("bad unit",
+         mutate(lambda b2: b2["obligations"]["attribution"].update(unit="week"))),
+        ("negative offset",
+         mutate(lambda b2: b2["obligations"]["attribution"].update(offset=-1))),
+        ("dangling depends_on",
+         mutate(lambda b2: b2["obligations"]["attribution"]
+                .update(depends_on=["ghost"]))),
+        ("dependency cycle", mutate(cycle)),
+        ("bad provided_at",
+         mutate(lambda b2: b2["materials"][0].update(provided_at="yesterday"))),
+        ("duplicate material id",
+         mutate(lambda b2: b2["materials"].append(dict(b2["materials"][0])))),
+        ("product material with component",
+         mutate(lambda b2: b2["materials"][0].update(component="art-a"))),
+        ("material unknown component",
+         mutate(lambda b2: b2["materials"].append(
+             {"id": "x", "type": "notice", "scope": "component",
+              "component": "ghost", "provided_at": "2026-09-26T10:00:00Z"}))),
+        ("rule all and any together",
+         mutate(lambda b2: b2["rules"]["obligations"]["attribution"].update(
+             {"all": [{"type": "notice"}], "any": [{"type": "x"}]}))),
+        ("rule empty all",
+         mutate(lambda b2: b2["rules"]["obligations"]["attribution"]
+                .update({"all": []}))),
+        ("rule unknown component",
+         mutate(lambda b2: b2["rules"]["obligations"]["attribution"].update(
+             {"component": "ghost", "type": "notice"}))),
+        ("rule leaf without constraint",
+         mutate(lambda b2: b2["rules"]["obligations"]["attribution"]
+                .update({"componentx": "n"}))),
+        ("rules not object", mutate(lambda b2: b2.update(rules=[]))),
+    ]
+    for label, bad in invalid:
+        code, b2 = call(
+            "POST", "/v1/release-batches/snap-rel-1/fulfillment-snapshot", bad)
+        check("snapshot: 422 on %s" % label, code == 422
+              and "instances" not in b2 and "snapshot_hash" not in b2,
+              "%s -> %s %s" % (label, code, json.dumps(b2)[:120]))
+
+    # materials are optional: empty array still yields a complete snapshot
+    empty = snapshot_body()
+    empty["materials"] = []
+    code, eout = call(
+        "POST", "/v1/release-batches/snap-rel-1/fulfillment-snapshot", empty)
+    check("snapshot: no materials -> all unsatisfiable, complete snapshot",
+          code == 200 and eout["summary"]["satisfied"] == 0
+          and eout["summary"]["overdue"] == 3
+          and eout["summary"]["pending"] == 3
+          and len(eout["instances"]) == 6
+          and all(i["gaps"][0]["reason"] == "no-matching-material"
+                  for i in eout["instances"])
+          and bool(eout["snapshot_hash"]),
+          json.dumps(eout.get("summary", {})),
+    )
 
 
 def run_legacy_migration_checks():

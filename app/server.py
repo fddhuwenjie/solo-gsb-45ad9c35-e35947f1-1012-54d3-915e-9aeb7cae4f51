@@ -21,6 +21,7 @@ Endpoints:
     POST /v1/assessments/compare
     POST /v1/release-batches
     GET  /v1/release-batches/{batch_id}
+    POST /v1/release-batches/{batch_id}/fulfillment-snapshot
 """
 
 import json
@@ -40,6 +41,7 @@ from .revisions import REVISION_ID_LEN
 from .review import build_impact_report, validate_review_body
 from .rules import validate_ruleset
 from .schedule import build_schedule
+from .snapshot import build_batch_snapshot
 from .solver import assess_normalized, build_confirmation, normalize_request
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
@@ -53,7 +55,10 @@ _ASSESS_RE = re.compile(
     r"(/(?:confirm|confirmation|fulfillment-check|obligation-schedule"
     r"|responsibility-plan|remediation-plan))?)?$"
 )
-_BATCH_RE = re.compile(r"^/v1/release-batches(?:/([A-Za-z0-9._-]{1,128}))?$")
+_BATCH_RE = re.compile(
+    r"^/v1/release-batches(?:/([A-Za-z0-9._-]{1,128})"
+    r"(/(?:fulfillment-snapshot))?)?$"
+)
 
 
 class Api:
@@ -371,6 +376,17 @@ class Api:
             raise NotFound("release batch %r not found" % batch_id)
         return manifest
 
+    def release_batch_snapshot(self, batch_id, body):
+        # Existence is a 404 state check; the snapshot builder then turns
+        # every invalid scheduling/evidence payload into a 422 as a whole,
+        # never a partial result.
+        manifest = self.store.get_release_batch(batch_id)
+        if manifest is None:
+            raise NotFound("release batch %r not found" % batch_id)
+        if not isinstance(body, dict):
+            raise ClientError("request body must be a JSON object")
+        return build_batch_snapshot(body, manifest, batch_id)
+
 
 def make_server(host, port, store):
     api = Api(store)
@@ -449,6 +465,7 @@ def make_server(host, port, store):
                                 "POST /v1/assessments/compare",
                                 "POST /v1/release-batches",
                                 "GET  /v1/release-batches/{batch_id}",
+                                "POST /v1/release-batches/{batch_id}/fulfillment-snapshot",
                             ],
                         },
                     )
@@ -460,8 +477,15 @@ def make_server(host, port, store):
                     return self._json(200, api.register_release_batch(self._body()))
 
                 m = _BATCH_RE.match(path)
-                if m and method == "GET" and m.group(1) is not None:
+                if m and method == "GET" and m.group(1) is not None \
+                        and m.group(2) is None:
                     return self._json(200, api.get_release_batch(m.group(1)))
+                if m and method == "POST" and m.group(1) is not None \
+                        and m.group(2) == "/fulfillment-snapshot":
+                    return self._json(
+                        200,
+                        api.release_batch_snapshot(m.group(1), self._body()),
+                    )
 
                 m = _REVISION_RE.match(path)
                 if m:

@@ -28,7 +28,7 @@ python3 main.py
 数据持久化在 SQLite（容器内 `/data/app.db`，本地默认 `./data/app.db`，
 环境变量 `APP_DB` 可改）。
 
-自检（启动临时实例跑 476 项端到端检查）：
+自检（启动临时实例跑 520 项端到端检查）：
 
 ```bash
 python3 tests/selftest.py
@@ -57,6 +57,7 @@ python3 tests/selftest.py
 | POST | `/v1/assessments/compare` | 两次核算的原子差异与最小归因对比 |
 | POST | `/v1/release-batches` | 登记不可变许可证发布批次（内容一致时幂等） |
 | GET | `/v1/release-batches/{batch_id}` | 读取已登记批次清单 |
+| POST | `/v1/release-batches/{batch_id}/fulfillment-snapshot` | 批次履约状态快照（截止日 + 证据判定） |
 
 ### 不可变修订与原子发布（含并发发布与回滚）
 
@@ -442,6 +443,124 @@ curl -sS "$BASE/v1/release-batches/release-2026-10-01"
 求值却记录旧修订”的错配；既有评估的规则快照（`rules` 列）继续保留，
 评估结果与确认/复演不因后续激活或回滚而漂移——内联规则（`"rules": {...}`）
 的评估依旧不依赖任何规则集。
+
+### 批次履约状态快照 `POST /v1/release-batches/{batch_id}/fulfillment-snapshot`
+
+针对一个**已冻结登记**的发布批次，一次性提交当前时刻、发布时刻、IANA
+时区、工作日/节假日、`{offset, unit, depends_on}` 截止规则、每份材料的
+`provided_at` 以及嵌套 `all`/`any` 证据规则，生成该批次截至当前时刻的
+履约状态快照。快照**只读**冻结清单（制品、去重后的组件及其义务——
+共享组件只计一次），批次不存在返回 **404**。
+
+请求体（`batch_id` 可省略；给出时必须与路径一致，否则 422）：
+
+```json
+{
+  "batch_id": "release-2026-10-01",
+  "now": "2026-10-10T12:00:00+08:00",
+  "release_at": "2026-09-25T16:00:00+08:00",
+  "timezone": "Asia/Shanghai",
+  "workdays": [1, 2, 3, 4, 5],
+  "holidays": ["2026-10-01", "2026-10-02"],
+  "obligations": {
+    "attribution":  {"offset": 30, "unit": "calendar_day", "depends_on": []},
+    "license-text": {"offset": 20, "unit": "calendar_day", "depends_on": []},
+    "source-offer": {"offset": 5,  "unit": "business_day",
+                     "depends_on": ["license-text"]}
+  },
+  "materials": [
+    {"id": "product-notice", "digest": "sha256:aaa",
+     "type": "notice", "scope": "product",
+     "provided_at": "2026-09-26T10:00:00+08:00"},
+    {"id": "common-copy", "digest": "sha256:bbb",
+     "type": "license-copy", "scope": "component", "component": "common",
+     "provided_at": "2026-09-27T10:00:00+08:00"},
+    {"id": "common-source-late", "digest": "sha256:ddd",
+     "type": "source-archive", "scope": "component", "component": "common",
+     "provided_at": "2026-10-08T10:00:00+08:00"}
+  ],
+  "rules": {"obligations": {
+    "attribution": {"type": "notice"},
+    "license-text": {"all": [
+      {"type": "notice"},
+      {"any": [{"type": "license-copy"}, {"type": "license-bundle"}]}
+    ]},
+    "source-offer": {"all": [
+      {"type": "source-archive"}, {"scope": "component"}
+    ]}
+  }}
+}
+```
+
+排期字段的语义与 `obligation-schedule` 完全一致：`now` 与 `release_at`
+都是带 `Z`/`±HH:MM` 偏移的 RFC 3339 时刻；先换算到 `timezone` 取**当地
+日期**；`offset` 自发布当地日期起算（`0` 即发布当日），工作日偏移只数
+属于 `workdays` 且非节假日的日子（发布当日不计入）；再沿无环
+`depends_on` 图反向收紧，`final(o) = min(raw(o), 所有后继的 final)`。
+**批次中每个制品级义务（清单 `artifact_obligations` 的并集）都必须有
+截止规则**；缺规则、未知时区、非法时刻/日期、悬空依赖或依赖成环整体
+返回 **422**。
+
+证据规则与材料的语义与 `fulfillment-check` 一致（`all`/`any` 互斥、
+数组非空；叶子可约束 `type`/`scope`/`component`；一个 `all` 的各个
+合取叶子可由**不同材料共同**满足；产品级材料覆盖全部组件，组件级只
+覆盖其声明组件）。区别有三处：
+
+- **按期限过滤**：判定一个实例时，只使用**在该义务最终截止日（含）
+  之前提供**、且覆盖该组件的材料。截止比较按**时区日期**进行（
+  `provided_at` 与截止日都换算到 `timezone` 取日期），截止日当天提供
+  的材料仍算数；晚于截止日提供的材料不参与满足判定，但会在该未满足
+  实例的 `gaps[].late_materials` 中列出。
+- **不做全局最优选材**：快照是对“期限内已提交的全部材料”的事实判定，
+  不存在选择优化；`satisfied_by` 列出真正参与满足规则的材料（死分支
+  上的命中材料不计入）。
+- 相同 `digest` **不去重**：每份提交是带有各自 `provided_at` 的独立
+  证据。`materials` 可省略或为空数组；某义务没有证据规则时，其实例
+  永远不可能 `satisfied`（缺口原因为 `no-evidence-rule`）。
+
+每个去重后的 `(组件, 义务)` 产生一条实例（共享组件只出现一次），
+状态为：
+
+| 状态 | 条件 |
+| --- | --- |
+| `satisfied` | 期限内材料已使证据规则成立 |
+| `overdue` | 当前当地日期**严格晚于**截止日且规则仍未满足（截止日当天不报逾期） |
+| `pending` | 截止日尚未到达（含截止日当天）且规则未满足 |
+
+未满足实例的 `gaps[]` 给出原因（`no-evidence-rule` /
+`no-matching-material` / `incomplete-evidence`）、仍无材料匹配的
+`missing_leaves`、期限内命中过任意叶子的 `candidate_materials` 以及
+逾期才提供的 `late_materials`。
+
+响应同时给出 `schedule`（每项义务的 `raw_deadline`/`deadline`/收紧链/
+覆盖组件，格式同 `obligation-schedule`）、规范化后的 `materials`
+（含 UTC 时刻与当地 `provided_date`）、逐实例结果与汇总
+`summary.total/satisfied/overdue/pending`。`snapshot_hash` 是规范化响应
+（不含哈希字段本身）的 SHA-256：**材料顺序、对象键序、`workdays`、
+`holidays`、`depends_on` 顺序都不改变快照与哈希**；同一时刻的不同
+写法（如 `2026-09-25T08:00:00Z` 与 `2026-09-25T16:00:00+08:00`）得到
+同一快照。排期或证据内容任何一处非法都整体 **422**，绝不产生部分
+结果；非对象请求体返回 400。
+
+```bash
+BASE=http://localhost:8080
+
+# 为已登记批次生成快照（now 在 source-offer 截止日 10-06 之后 -> 逾期）
+curl -sS -X POST \
+  "$BASE/v1/release-batches/release-2026-10-01/fulfillment-snapshot" \
+  -H 'Content-Type: application/json' -d @snapshot.json | python3 -m json.tool
+
+# 截止日当天复查：source-offer 未满足也只能是 pending，绝不报 overdue
+curl -sS -X POST \
+  "$BASE/v1/release-batches/release-2026-10-01/fulfillment-snapshot" \
+  -H 'Content-Type: application/json' -d '{ …, "now": "2026-10-06T23:59:00+08:00" }'
+
+# 未知批次 -> 404；缺义务规则/坏时区/坏 provided_at/坏证据规则 -> 422
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+  "$BASE/v1/release-batches/no-such/fulfillment-snapshot" \
+  -H 'Content-Type: application/json' -d @snapshot.json
+# 404
+```
 
 **旧库迁移**：升级后首次打开旧版 SQLite 时，每个现有 `rulesets` 行
 （即旧 PUT 写入的内容）原样成为该规则集的**首个活动修订**（修订 id 为
@@ -1230,6 +1349,7 @@ app/rules.py          默认规则集 + 规则校验规范化
 app/revisions.py      不可变修订标识：规范化内容哈希（修订 id / content_hash）
 app/review.py         发布前影响审查：批次信封校验、用目标修订不可变快照重算核算（旧/新状态、summary_hash、采用分支、义务差异、放行→冲突/错误汇总、report_hash）
 app/batches.py        不可变发布批次：批次信封校验（batch_id + 1～50 条目）、同事务快照核验与共享组件/制品去重合并（名称/版本/许可证一致校验、义务并集、rule_revisions、batch_hash）
+app/snapshot.py      批次履约状态快照：期限内材料按 all/any 证据规则判定去重后组件义务（satisfied/overdue/pending）、时区日期期限窗口、depends_on 最终截止日、缺口/命中材料与逾期汇总（snapshot_hash）
 app/solver.py         义务传播、OR 分支选择（穷举 + 分支定界）、冲突检测、确认版生成
 app/fulfillment.py    履约材料核算：义务实例展开、all/any 证据规则（叶子命中按材料集合累积，可由多份材料共同满足）、全局最小集合选择（穷举 + 分支定界）
 app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日历日/工作日偏移、沿无环依赖反向收紧与收紧链还原
@@ -1238,7 +1358,7 @@ app/remediation.py   许可证整改：候选表达式/成本校验（非法整�
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
 app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、影响审查的单读事务前置条件核验、发布批次的单写事务登记（锁定核算与规则修订、全成或全败、幂等）
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     476 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变）
+tests/selftest.py     520 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变、批次履约状态快照：期限窗口/逾期判定/共享组件一次计数/顺序无关哈希）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 
