@@ -57,15 +57,15 @@ _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 # request normalization
 # ---------------------------------------------------------------------------
 
-def _parse_release_at(value):
+def _parse_rfc3339(value, field_name="release_at"):
     """Parse an RFC 3339 timestamp into an aware datetime (HTTP 422)."""
     if not isinstance(value, str):
-        raise ClientError("release_at must be an RFC 3339 timestamp string")
+        raise ClientError("%s must be an RFC 3339 timestamp string" % field_name)
     text = value.strip()
     m = _RFC3339_RE.match(text)
     if not m:
         raise UnprocessableError(
-            "release_at %r is not a valid RFC 3339 timestamp" % value
+            "%s %r is not a valid RFC 3339 timestamp" % (field_name, value)
         )
     year, month, day, hour, minute, second = (int(g) for g in m.groups()[:6])
     frac = m.group(7)
@@ -77,7 +77,7 @@ def _parse_release_at(value):
         oh, om = int(offset[1:3]), int(offset[4:6])
         if oh > 23 or om > 59:
             raise UnprocessableError(
-                "release_at %r has an invalid UTC offset" % value
+                "%s %r has an invalid UTC offset" % (field_name, value)
             )
         delta = timedelta(hours=oh, minutes=om)
         tz = timezone(delta if offset[0] == "+" else -delta)
@@ -85,7 +85,8 @@ def _parse_release_at(value):
         return datetime(year, month, day, hour, minute, second, micro, tz)
     except ValueError as exc:
         raise UnprocessableError(
-            "release_at %r is not a valid RFC 3339 timestamp: %s" % (value, exc)
+            "%s %r is not a valid RFC 3339 timestamp: %s"
+            % (field_name, value, exc)
         )
 
 
@@ -117,7 +118,7 @@ def normalize_schedule_request(body, artifact_obligations):
     if not isinstance(body, dict):
         raise ClientError("request body must be a JSON object")
 
-    release_at = _parse_release_at(body.get("release_at"))
+    release_at = _parse_rfc3339(body.get("release_at"))
 
     tz_name = body.get("timezone")
     if not isinstance(tz_name, str) or not tz_name.strip():

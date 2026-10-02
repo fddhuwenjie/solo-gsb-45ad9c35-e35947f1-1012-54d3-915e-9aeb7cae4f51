@@ -28,7 +28,7 @@ python3 main.py
 数据持久化在 SQLite（容器内 `/data/app.db`，本地默认 `./data/app.db`，
 环境变量 `APP_DB` 可改）。
 
-自检（启动临时实例跑 476 项端到端检查）：
+自检（启动临时实例跑 490 项端到端检查）：
 
 ```bash
 python3 tests/selftest.py
@@ -57,6 +57,7 @@ python3 tests/selftest.py
 | POST | `/v1/assessments/compare` | 两次核算的原子差异与最小归因对比 |
 | POST | `/v1/release-batches` | 登记不可变许可证发布批次（内容一致时幂等） |
 | GET | `/v1/release-batches/{batch_id}` | 读取已登记批次清单 |
+| POST | `/v1/release-batches/{batch_id}/fulfillment-snapshot` | 生成冻结批次履约状态快照 |
 
 ### 不可变修订与原子发布（含并发发布与回滚）
 
@@ -449,6 +450,113 @@ curl -sS "$BASE/v1/release-batches/release-2026-10-01"
 id；旧 PUT/GET、既有评估快照与确认版语义全部保持不变。发布批次使用的
 新表在同一迁移中以 `CREATE TABLE IF NOT EXISTS` 建立（`user_version`
 升至 3），旧库可直接打开。
+
+### 发布批次履约状态快照 `POST /v1/release-batches/{batch_id}/fulfillment-snapshot`
+
+对一个**已冻结的发布批次**计算履约状态快照。服务只读取批次清单中的制品、
+去重组件和义务并集：共享组件在结果中只出现一次；每次判定的单位为
+`(component, obligation)`。未知 `batch_id` 返回 **404**；排期或证据规则
+无效时整体返回 **422**，不会输出部分结果。
+
+请求体同时给出当前时刻与发布时刻（均为 RFC 3339）、IANA 时区、工作日/
+节假日、义务排期规则、带 `provided_at` 的材料，以及可嵌套 `all`/`any`
+的证据规则：
+
+```json
+{
+  "current_at": "2026-10-06T09:59:00Z",
+  "release_at": "2026-10-01T12:00:00Z",
+  "timezone": "Pacific/Kiritimati",
+  "workdays": [1, 2, 3, 4, 5],
+  "holidays": ["2026-10-04"],
+  "obligations": {
+    "attribution": {"offset": 30, "unit": "calendar_day", "depends_on": []},
+    "license-text": {"offset": 2, "unit": "business_day",
+                     "depends_on": ["attribution"]},
+    "source-offer": {"offset": 10, "unit": "calendar_day",
+                     "depends_on": ["license-text"]}
+  },
+  "materials": [
+    {"id": "notice", "digest": "sha256:…", "type": "notice",
+     "scope": "product", "provided_at": "2026-10-02T12:00:00+14:00"},
+    {"id": "copy-common", "digest": "sha256:…", "type": "license-copy",
+     "scope": "component", "component": "common",
+     "provided_at": "2026-10-05T12:00:00+14:00"}
+  ],
+  "rules": {"obligations": {
+    "attribution": {"type": "notice"},
+    "license-text": {"all": [{"type": "notice"}, {"type": "license-copy"}]},
+    "source-offer": {"type": "source-archive"}
+  }}
+}
+```
+
+语义与 `/obligation-schedule` 相同：先把发布时刻换算到 `timezone` 并取
+当地日期，按 `offset`/`unit` 计算原始截止日，再沿 `depends_on` 反向收紧。
+冻结组件义务并集中的**每个义务**都必须有排期规则和证据规则；允许额外的
+排期里程碑，但没有证据规则的额外义务不会产生组件实例。未知时区、错误
+日期格式、悬空依赖、依赖环、证据引用不存在组件，或材料声明的组件不在
+冻结批次中，均返回 **422**。材料时间按同一时区换算成当地日期；晚于
+当前日期的材料是无效请求（**422**）。
+
+对每个组件义务，只使用**不晚于该义务最终截止日**且不晚于当前日期的材料：
+
+- 截止日前规则已成立 → `satisfied`；
+- 已过截止日且规则未成立 → `overdue`；
+- 尚未到截止日且规则未成立 → `pending`。
+
+因此，**未到最终截止日绝不会报 `overdue`**。证据叶节点按材料集合累积：
+多份材料可共同满足一个 `all`；产品级材料可覆盖各组件，组件级材料只覆盖
+其声明的组件。相同 `digest` 且 `type`/`scope`/`component`/`provided_at`
+一致的材料合并为一份；元数据冲突返回 **422**。
+
+响应既在 `items[]` 中给出每个组件义务的完整记录，也提供按实例 ID 索引的
+`deadlines`、`statuses`、`gaps` 和 `matched_materials`，并汇总逾期与待办
+数量；同时返回完整排期和规范化后的材料记录。示例（节选）：
+
+```json
+{
+  "batch_id": "release-2026-10-01",
+  "batch_hash": "…",
+  "current_at": "2026-10-06T09:59:00Z",
+  "release_at": "2026-10-01T12:00:00Z",
+  "timezone": "Pacific/Kiritimati",
+  "current_date": "2026-10-06",
+  "release_date": "2026-10-02",
+  "schedule": [
+    {"obligation": "license-text", "components": ["common"],
+     "raw_deadline": "2026-10-05", "deadline": "2026-10-05",
+     "tightened": false}
+  ],
+  "items": [
+    {"id": "component:common:license-text", "component": "common",
+     "obligation": "license-text", "deadline": "2026-10-05",
+     "status": "satisfied", "gap": null,
+     "matched_materials": ["copy-common", "notice"]},
+    {"id": "component:common:source-offer", "component": "common",
+     "obligation": "source-offer", "deadline": "2026-10-12",
+     "status": "pending",
+     "gap": {"reason": "no-matching-material",
+             "candidate_materials": [], "missing_leaves": []},
+     "matched_materials": []}
+  ],
+  "summary": {"total": 6, "satisfied": 5, "pending": 1, "overdue": 0},
+  "snapshot_hash": "…"
+}
+```
+
+`gap` 为 `null` 表示已满足；未满足时给出 `no-matching-material` 或
+`incomplete-evidence`、候选材料及仍缺失的叶子约束。材料、规则、工作日、
+节假日和依赖数组的提交顺序都不影响结果与 `snapshot_hash`；同一冻结批次
+和同一规范化请求重复调用结果一致。该接口只读，不修改批次、不写快照记录。
+
+```bash
+BASE=http://localhost:8080
+curl -sS -X POST \
+  "$BASE/v1/release-batches/release-2026-10-01/fulfillment-snapshot" \
+  -H 'Content-Type: application/json' \
+  -d @snapshot.json
+```
 
 ### 提交核算 `POST /v1/assessments`
 
@@ -1233,12 +1341,13 @@ app/batches.py        不可变发布批次：批次信封校验（batch_id + 1�
 app/solver.py         义务传播、OR 分支选择（穷举 + 分支定界）、冲突检测、确认版生成
 app/fulfillment.py    履约材料核算：义务实例展开、all/any 证据规则（叶子命中按材料集合累积，可由多份材料共同满足）、全局最小集合选择（穷举 + 分支定界）
 app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日历日/工作日偏移、沿无环依赖反向收紧与收紧链还原
+app/snapshot.py       发布批次履约快照：冻结组件义务、期限内证据过滤、all/any 联合满足、pending/overdue 判定与顺序无关 snapshot_hash
 app/responsibility.py 责任分工：责任项展开（制品级/组件级）、人员资格/容量/成本规范化、全局最优分工（穷举 + 最小费用流界的完备分支定界）、409 最佳部分方案与原因
 app/remediation.py   许可证整改：候选表达式/成本校验（非法整体 422）、在持久化快照上重算的全局最优异构组合（穷举 + 完备分支定界，精确有理数成本）、放行方案与 409 唯一最佳失败方案
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
 app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、影响审查的单读事务前置条件核验、发布批次的单写事务登记（锁定核算与规则修订、全成或全败、幂等）
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     476 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变）
+tests/selftest.py     490 项端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变、批次履约快照）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 

@@ -3890,6 +3890,188 @@ def run_release_batch_checks():
     code, b = call("GET", "/v1/release-batches/no-such-batch")
     check("batch: GET unknown -> 404", code == 404)
 
+    # -- fulfillment snapshot ------------------------------------------------
+    snapshot_body = {
+        # 2026-10-01T12:00Z is 2026-10-02 in Pacific/Kiritimati (UTC+14),
+        # proving that schedule/material windows use the requested local date.
+        "current_at": "2026-10-06T09:59:00Z",
+        "release_at": "2026-10-01T12:00:00Z",
+        "timezone": "Pacific/Kiritimati",
+        "workdays": [7, 6, 5, 4, 3, 2, 1],
+        "holidays": ["2026-10-04"],
+        "obligations": {
+            "attribution": {"offset": 30, "unit": "calendar_day",
+                            "depends_on": []},
+            "license-text": {"offset": 2, "unit": "business_day",
+                             "depends_on": ["attribution"]},
+            "source-offer": {"offset": 10, "unit": "calendar_day",
+                             "depends_on": ["license-text"]},
+        },
+        "materials": [
+            {"id": "notice", "digest": "notice-digest", "type": "notice",
+             "scope": "product",
+             "provided_at": "2026-10-02T12:00:00+14:00"},
+            {"id": "copy-art-a", "digest": "copy-art", "type": "license-copy",
+             "scope": "component", "component": "art-a",
+             "provided_at": "2026-10-05T12:00:00+14:00"},
+            {"id": "copy-common", "digest": "copy-common", "type": "license-copy",
+             "scope": "component", "component": "common",
+             "provided_at": "2026-10-05T12:00:00+14:00"},
+        ],
+        "rules": {"obligations": {
+            "attribution": {"type": "notice"},
+            "license-text": {"all": [
+                {"type": "notice"},
+                {"any": [{"type": "license-copy"}]},
+            ]},
+            "source-offer": {"type": "source-archive"},
+        }},
+    }
+    snapshot_path = "/v1/release-batches/rel-001/fulfillment-snapshot"
+    code, snap = call("POST", snapshot_path, snapshot_body)
+    check(
+        "snapshot: before deadline reports pending, never overdue",
+        code == 200
+        and snap.get("release_date") == "2026-10-02"
+        and snap.get("current_date") == "2026-10-06"
+        and snap.get("summary") == {
+            "total": 6, "satisfied": 5, "pending": 1, "overdue": 0},
+        json.dumps(snap, sort_keys=True)[:300] if code == 200 else str(snap),
+    )
+    schedule = {s["obligation"]: s for s in snap.get("schedule", [])}
+    check(
+        "snapshot: business-day and dependency-aware deadlines",
+        schedule["attribution"]["deadline"] == "2026-10-05"
+        and schedule["attribution"]["raw_deadline"] == "2026-11-01"
+        and schedule["attribution"]["tightened"] is True
+        and schedule["attribution"]["tightening_chain"]
+        == ["attribution", "license-text"]
+        and schedule["license-text"]["deadline"] == "2026-10-05"
+        and schedule["license-text"]["raw_deadline"] == "2026-10-05"
+        and schedule["license-text"]["tightened"] is False
+        and schedule["source-offer"]["deadline"] == "2026-10-12"
+        and schedule["source-offer"]["depends_on"] == ["license-text"]
+        and schedule["license-text"]["components"] == ["art-a", "common"],
+        json.dumps(schedule, sort_keys=True),
+    )
+    by_item = {i["id"]: i for i in snap.get("items", [])}
+    check(
+        "snapshot: shared component counted once with scoped joint evidence",
+        sorted(by_item) == [
+            "component:art-a:attribution",
+            "component:art-a:license-text",
+            "component:art-b:attribution",
+            "component:common:attribution",
+            "component:common:license-text",
+            "component:common:source-offer",
+        ]
+        and by_item["component:art-a:license-text"]["matched_materials"]
+        == ["copy-art-a", "notice"]
+        and by_item["component:common:license-text"]["matched_materials"]
+        == ["copy-common", "notice"]
+        and by_item["component:art-b:attribution"]["matched_materials"] == ["notice"]
+        and by_item["component:common:source-offer"]["status"] == "pending"
+        and by_item["component:common:source-offer"]["gap"] == {
+            "reason": "no-matching-material",
+            "candidate_materials": [],
+            "missing_leaves": [],
+        }
+        and by_item["component:common:source-offer"]["matched_materials"] == [],
+        json.dumps(by_item, sort_keys=True)[:500],
+    )
+    snapshot_hash = snap["snapshot_hash"]
+    shuffled_snapshot = {
+        "rules": {"obligations": {
+            "source-offer": snapshot_body["rules"]["obligations"]["source-offer"],
+            "license-text": snapshot_body["rules"]["obligations"]["license-text"],
+            "attribution": snapshot_body["rules"]["obligations"]["attribution"],
+        }},
+        "materials": list(reversed(snapshot_body["materials"])),
+        "holidays": list(reversed(snapshot_body["holidays"])),
+        "workdays": list(reversed(snapshot_body["workdays"])),
+        "obligations": {
+            "source-offer": dict(snapshot_body["obligations"]["source-offer"]),
+            "license-text": dict(snapshot_body["obligations"]["license-text"]),
+            "attribution": dict(snapshot_body["obligations"]["attribution"]),
+        },
+        "timezone": snapshot_body["timezone"],
+        "release_at": snapshot_body["release_at"],
+        "current_at": snapshot_body["current_at"],
+    }
+    code, snap_shuffled = call("POST", snapshot_path, shuffled_snapshot)
+    check("snapshot: request ordering does not change hash",
+          code == 200 and snap_shuffled.get("snapshot_hash") == snapshot_hash)
+
+    def snapshot_copy():
+        return json.loads(json.dumps(snapshot_body))
+
+    overdue_body = snapshot_copy()
+    overdue_body["current_at"] = "2026-10-20T12:00:00Z"  # local 2026-10-21
+    code, overdue = call("POST", snapshot_path, overdue_body)
+    overdue_item = {i["id"]: i for i in overdue.get("items", [])}.get(
+        "component:common:source-offer", {})
+    check(
+        "snapshot: after deadline missing evidence is overdue with gap",
+        code == 200
+        and overdue.get("summary") == {
+            "total": 6, "satisfied": 5, "pending": 0, "overdue": 1}
+        and overdue_item.get("status") == "overdue"
+        and overdue_item.get("gap", {}).get("reason") == "no-matching-material"
+        and overdue_item.get("gap", {}).get("candidate_materials") == []
+        and overdue_item.get("matched_materials") == [],
+        json.dumps(overdue, sort_keys=True)[:400] if code == 200 else str(overdue),
+    )
+
+    code, b = call("POST", "/v1/release-batches/missing/fulfillment-snapshot",
+                   snapshot_body)
+    check("snapshot: unknown batch -> 404", code == 404)
+    invalid_schedule = snapshot_copy()
+    invalid_schedule["obligations"]["attribution"]["depends_on"] = ["license-text"]
+    invalid_schedule["obligations"]["license-text"]["depends_on"] = ["attribution"]
+    code, b = call("POST", snapshot_path, invalid_schedule)
+    check("snapshot: schedule dependency cycle -> 422", code == 422, str(b)[:120])
+    missing_rule = snapshot_copy()
+    del missing_rule["obligations"]["source-offer"]
+    code, b = call("POST", snapshot_path, missing_rule)
+    check("snapshot: missing schedule rule -> 422", code == 422, str(b)[:120])
+    missing_evidence = snapshot_copy()
+    missing_evidence["rules"] = {"obligations": dict(
+        snapshot_body["rules"]["obligations"])}
+    del missing_evidence["rules"]["obligations"]["source-offer"]
+    code, b = call("POST", snapshot_path, missing_evidence)
+    check("snapshot: missing evidence rule -> 422", code == 422, str(b)[:120])
+    bad_timezone = snapshot_copy()
+    bad_timezone["timezone"] = "Mars/Olympus"
+    code, b = call("POST", snapshot_path, bad_timezone)
+    check("snapshot: unknown timezone -> 422", code == 422, str(b)[:120])
+    ghost_rule = snapshot_copy()
+    ghost_rule["rules"] = {"obligations": dict(
+        snapshot_body["rules"]["obligations"],
+        attribution={"component": "ghost"})}
+    code, b = call("POST", snapshot_path, ghost_rule)
+    check("snapshot: evidence rule outside frozen batch -> 422",
+          code == 422, str(b)[:120])
+    ghost_material = snapshot_copy()
+    ghost_material["materials"] = [
+        dict(snapshot_body["materials"][0], scope="component", component="ghost")
+    ]
+    code, b = call("POST", snapshot_path, ghost_material)
+    check("snapshot: component material outside frozen batch -> 422",
+          code == 422, str(b)[:120])
+    future_material = snapshot_copy()
+    future_material["materials"] = [{
+        "id": "future-source", "digest": "future", "type": "source-archive",
+        "scope": "component", "component": "common",
+        "provided_at": "2026-10-20T12:00:00+14:00",
+    }]
+    code, b = call("POST", snapshot_path, future_material)
+    check("snapshot: future provided_at evidence -> 422",
+          code == 422, str(b)[:120])
+    malformed = snapshot_copy()
+    malformed["materials"] = [{"id": "bad"}]
+    code, b = call("POST", snapshot_path, malformed)
+    check("snapshot: malformed material envelope -> 400", code == 400, str(b)[:120])
+
     # -- stateful rejections --------------------------------------------------
     code, b = register("rel-missing",
                        [entry("deadbeef" * 4, "x", "1")])
